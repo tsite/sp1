@@ -29,6 +29,7 @@ use crate::stark::DebugConstraintBuilder;
 use crate::stark::ProverConstraintFolder;
 use crate::stark::ShardProof;
 use crate::stark::VerifierConstraintFolder;
+use crate::utils::Client;
 
 use super::Chip;
 use super::Com;
@@ -271,6 +272,7 @@ impl<SC: StarkGenericConfig, A: MachineAir<Val<SC>>> StarkMachine<SC, A> {
         pk: &StarkProvingKey<SC>,
         record: A::Record,
         challenger: &mut SC::Challenger,
+        client: &mut Client,
     ) -> MachineProof<SC>
     where
         A: for<'a> Air<ProverConstraintFolder<'a, SC>>
@@ -283,7 +285,7 @@ impl<SC: StarkGenericConfig, A: MachineAir<Val<SC>>> StarkMachine<SC, A> {
 
         // We care about profiling this function, can pass in the client here.
         tracing::info_span!("prove_shards")
-            .in_scope(|| P::prove_shards(self, pk, shards, challenger))
+            .in_scope(|| P::prove_shards(self, pk, shards, challenger, client))
     }
 
     pub const fn config(&self) -> &SC {

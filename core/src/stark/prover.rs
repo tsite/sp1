@@ -3,6 +3,7 @@ use serde::Serialize;
 use std::cmp::Reverse;
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::Instant;
 
 use itertools::Itertools;
 use p3_air::Air;
@@ -27,7 +28,8 @@ use crate::stark::record::MachineRecord;
 use crate::stark::MachineChip;
 use crate::stark::PackedChallenge;
 use crate::stark::ProverConstraintFolder;
-use crate::utils::env;
+use crate::utils::Client;
+use crate::utils::{env, MainCommitment};
 
 fn chunk_vec<T>(mut vec: Vec<T>, chunk_size: usize) -> Vec<Vec<T>> {
     let mut result = Vec::new();
@@ -45,6 +47,7 @@ pub trait Prover<SC: StarkGenericConfig, A: MachineAir<Val<SC>>> {
         pk: &StarkProvingKey<SC>,
         shards: Vec<A::Record>,
         challenger: &mut SC::Challenger,
+        client: &mut Client,
     ) -> MachineProof<SC>
     where
         A: for<'a> Air<ProverConstraintFolder<'a, SC>>
@@ -68,6 +71,7 @@ where
         pk: &StarkProvingKey<SC>,
         shards: Vec<A::Record>,
         challenger: &mut SC::Challenger,
+        client: &mut Client,
     ) -> MachineProof<SC>
     where
         A: for<'a> Air<ProverConstraintFolder<'a, SC>>
@@ -79,7 +83,10 @@ where
 
         // Phase 1 commitment. Question: how much time do we spend in phase 1 commitment.
         // Generate and commit the traces for each segment.
-        let (shard_commits, shard_data) = Self::commit_shards(machine, &shards);
+
+        let now = Instant::now();
+        let (shard_commits, shard_data) = Self::commit_shards(machine, &shards, client);
+        client.phase_1_commitments.push(now.elapsed());
 
         // Observe the challenges for each segment.
         tracing::debug_span!("observing all challenges").in_scope(|| {
@@ -101,6 +108,11 @@ where
         let chunk_size = std::cmp::max(chunking_multiplier * shards.len() / num_cpus::get(), 1);
         let config = machine.config();
         let reconstruct_commitments = env::reconstruct_commitments();
+        if reconstruct_commitments {
+            client
+                .main_commitments
+                .resize_with(shards.len() + 1, Default::default);
+        }
         let shard_data_chunks = chunk_vec(shard_data, chunk_size);
         let shard_chunks = chunk_vec(shards, chunk_size);
         let parent_span = tracing::debug_span!("open_shards");
@@ -117,7 +129,18 @@ where
                                 .in_scope(|| {
                                     let idx = shard.index() as usize;
                                     let data = if reconstruct_commitments {
-                                        Self::commit_main(config, machine, &shard, idx)
+                                        let mut main_commitment =
+                                            client.main_commitments[idx].lock().unwrap();
+                                        let now = Instant::now();
+                                        let result = Self::commit_main(
+                                            config,
+                                            machine,
+                                            &shard,
+                                            idx,
+                                            &mut main_commitment,
+                                        );
+                                        main_commitment.total_duration = now.elapsed();
+                                        result
                                     } else {
                                         data.materialize()
                                             .expect("failed to materialize shard main data")
@@ -164,6 +187,7 @@ where
         machine: &StarkMachine<SC, A>,
         shard: &A::Record,
         index: usize,
+        client: &mut MainCommitment,
     ) -> ShardMainData<SC> {
         // Filter the chips based on what is used.
         let shard_chips = machine.shard_chips(shard).collect::<Vec<_>>();
@@ -171,18 +195,24 @@ where
         // For each chip, generate the trace.
         // Profile trace generation.
         let parent_span = tracing::debug_span!("generate traces for shard");
+        client
+            .chips
+            .resize_with(shard_chips.len(), Default::default);
         let mut named_traces = parent_span.in_scope(|| {
             shard_chips
-                .par_iter()
-                .map(|chip| {
+                .par_iter().enumerate()
+                .map(|(idx, chip)| {
                     let chip_name = chip.name();
-
+                    let mut chip_stats = client.chips[idx].lock().unwrap();
+                    chip_stats.name.clone_from(&chip_name);
+                    let now = Instant::now();
                     // We need to create an outer span here because, for some reason,
                     // the #[instrument] macro on the chip impl isn't attaching its span to `parent_span`
                     // to avoid the unnecessary span, remove the #[instrument] macro.
                     let trace =
                         tracing::debug_span!(parent: &parent_span, "generate trace for chip", %chip_name)
                             .in_scope(|| chip.generate_trace(shard, &mut A::Record::default()));
+                    chip_stats.duration = now.elapsed();
                     (chip_name, trace)
                 })
                 .collect::<Vec<_>>()
@@ -549,6 +579,7 @@ where
     pub fn commit_shards<F, EF>(
         machine: &StarkMachine<SC, A>,
         shards: &[A::Record],
+        client: &mut Client,
     ) -> (Vec<Com<SC>>, Vec<ShardMainDataWrapper<SC>>)
     where
         F: PrimeField32,
@@ -568,6 +599,10 @@ where
         let finished = AtomicU32::new(0);
         let chunk_size = std::cmp::max(shards.len() / num_cpus::get(), 1);
         let parent_span = tracing::debug_span!("commit to all shards");
+
+        client
+            .main_commitments
+            .resize_with(shards.len() + 1, Default::default);
         let (commitments, shard_main_data): (Vec<_>, Vec<_>) = parent_span.in_scope(|| {
             shards
                 .par_chunks(chunk_size)
@@ -579,8 +614,17 @@ where
                                 || {
                                     let index = shard.index();
                                     // How much time are we spending per-shard commiting, let's evaluate whether it is balanced
-                                    let data =
-                                        Self::commit_main(config, machine, shard, index as usize);
+                                    let mut main_commitment =
+                                        client.main_commitments[index as usize].lock().unwrap();
+                                    let now = Instant::now();
+                                    let data = Self::commit_main(
+                                        config,
+                                        machine,
+                                        shard,
+                                        index as usize,
+                                        &mut main_commitment,
+                                    );
+                                    main_commitment.total_duration = now.elapsed();
                                     finished.fetch_add(1, Ordering::Relaxed);
                                     let commitment = data.main_commit.clone();
                                     let data = if reconstruct_commitments {

@@ -1,5 +1,6 @@
 use std::fs::File;
 use std::io::{Seek, Write};
+use std::time::Duration;
 use web_time::Instant;
 
 use crate::air::MachineAir;
@@ -26,6 +27,8 @@ use crate::{
     stark::StarkGenericConfig,
     stark::{LocalProver, OpeningProof, ShardMainData},
 };
+
+use std::sync::Mutex;
 
 const LOG_DEGREE_BOUND: usize = 31;
 
@@ -75,6 +78,28 @@ pub fn run_test_core(
     run_test_machine(record, machine, pk, vk)
 }
 
+#[derive(Default, Clone, Debug)]
+pub struct ChipStats {
+    pub name: String,
+    pub duration: Duration,
+}
+
+#[derive(Default, Debug)]
+pub struct MainCommitment {
+    pub total_duration: Duration,
+    pub chips: Vec<Mutex<ChipStats>>,
+}
+
+impl MainCommitment {}
+
+#[derive(Default, Debug)]
+pub struct Client {
+    pub phase_1_commitments: Vec<Duration>,
+    pub main_commitments: Vec<Mutex<MainCommitment>>,
+}
+
+impl Client {}
+
 // Calls run_test_machine which is the core of the core proof generation logic.
 #[allow(unused_variables)]
 pub fn run_test_machine<SC, A>(
@@ -109,7 +134,11 @@ where
     let start = Instant::now();
     let mut challenger = machine.config().challenger();
     // Instantiate some sort of client and pass it into this function.
-    let proof = machine.prove::<LocalProver<SC, A>>(&pk, record, &mut challenger);
+    let mut client: Client = Default::default();
+    let proof = machine.prove::<LocalProver<SC, A>>(&pk, record, &mut challenger, &mut client);
+    println!("phase_1_commitments: {:?}", client.phase_1_commitments);
+    println!("main_commitments: {:?}", client.main_commitments);
+
     let time = start.elapsed().as_millis();
     let nb_bytes = bincode::serialize(&proof).unwrap().len();
 
@@ -218,10 +247,11 @@ where
 
         reset_seek(&mut *file);
         cycles += events.cpu_events.len();
+        let mut client: Client = Default::default();
         let shards =
             tracing::debug_span!("shard").in_scope(|| machine.shard(events, &sharding_config));
         let (commitments, commit_data) = tracing::info_span!("commit")
-            .in_scope(|| LocalProver::commit_shards(&machine, &shards));
+            .in_scope(|| LocalProver::commit_shards(&machine, &shards, &mut client));
 
         shard_main_datas.push(commit_data);
 
@@ -251,8 +281,14 @@ where
             .into_iter()
             .map(|shard| {
                 let config = machine.config();
-                let shard_data =
-                    LocalProver::commit_main(config, &machine, &shard, shard.index() as usize);
+                let mut client = Default::default();
+                let shard_data = LocalProver::commit_main(
+                    config,
+                    &machine,
+                    &shard,
+                    shard.index() as usize,
+                    &mut client,
+                );
 
                 let chip_ordering = shard_data.chip_ordering.clone();
                 let ordered_chips = machine
@@ -308,7 +344,9 @@ where
     // Prove the program.
     let start = Instant::now();
     let cycles = runtime.state.global_clk;
-    let proof = machine.prove::<LocalProver<_, _>>(&pk, runtime.record, &mut challenger);
+    let mut client: Client = Default::default();
+    let proof =
+        machine.prove::<LocalProver<_, _>>(&pk, runtime.record, &mut challenger, &mut client);
     let time = start.elapsed().as_millis();
     let nb_bytes = bincode::serialize(&proof).unwrap().len();
 
